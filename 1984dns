@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# 1984dns — CLI for 1984.is FreeDNS zone management
+# One-liner DNS record operations from the terminal.
+#
+# Configuration: ~/.config/1984dns/config or environment variables
+#
+#   DNS1984_USER=you@example.com
+#   DNS1984_PASS=yourpassword
+# ---------------------------------------------------------------------------
+
+VERSION="1.0.0"
+COOKIE_FILE="${HOME}/.cache/1984dns/cookies.txt"
+ZONE_CACHE="${HOME}/.cache/1984dns/zones.cache"
+CONFIG_FILE="${HOME}/.config/1984dns/config"
+BASE_URL="https://1984.is"
+
+# ---------------------------------------------------------------------------
+# Load config (file first, env overrides)
+# ---------------------------------------------------------------------------
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+USER="${DNS1984_USER:-}"
+PASS="${DNS1984_PASS:-}"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+mkdir -p "$(dirname "$COOKIE_FILE")"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+check_creds() {
+  [[ -z "$USER" ]] && die "DNS1984_USER not set. Export it or add to ${CONFIG_FILE}"
+  [[ -z "$PASS" ]] && die "DNS1984_PASS not set. Export it or add to ${CONFIG_FILE}"
+}
+
+ensure_login() {
+  check_creds
+
+  # Reuse session if still valid
+  if [[ -f "$COOKIE_FILE" ]]; then
+    local check
+    check=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/api/auth/" 2>/dev/null || echo '{}')
+    if grep -q '"ok": true' <<< "$check"; then
+      return 0
+    fi
+  fi
+
+  # Fresh login
+  local login_page csrf
+  login_page=$(curl -s -c "$COOKIE_FILE" "${BASE_URL}/login/")
+  csrf=$(grep -oP 'csrfmiddlewaretoken" value="\K[^"]+' <<< "$login_page" || true)
+  [[ -z "$csrf" ]] && die "Could not get CSRF token from 1984.is"
+
+  local result
+  result=$(curl -s \
+    -b "$COOKIE_FILE" \
+    -c "$COOKIE_FILE" \
+    -X POST "${BASE_URL}/api/auth/" \
+    -H "Referer: ${BASE_URL}/login/" \
+    -H "X-CSRFToken: ${csrf}" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    -d "username=${USER}&password=${PASS}&otpkey=")
+
+  if ! grep -q '"loggedin": true' <<< "$result"; then
+    die "Login failed. Check your credentials."
+  fi
+}
+
+get_csrf() {
+  grep -oP 'csrftoken\s+\K\S+' "$COOKIE_FILE" | tail -1
+}
+
+# ---------------------------------------------------------------------------
+# Zone discovery — auto-discovers zones from your account
+# ---------------------------------------------------------------------------
+discover_zones() {
+  ensure_login
+  local html
+  html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/")
+  local zone_ids
+  zone_ids=$(grep -oP '/domains/zone/(\d+)/' <<< "$html" | grep -oP '\d+' | sort -u)
+
+  mkdir -p "$(dirname "$ZONE_CACHE")"
+  > "$ZONE_CACHE"
+
+  for zid in $zone_ids; do
+    local zhtml zone_name
+    zhtml=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/zone/${zid}/")
+    zone_name=$(grep -oP 'id="zone" value="\K[^"]*' <<< "$zhtml" || true)
+    if [[ -n "$zone_name" ]]; then
+      echo "${zone_name}=${zid}" >> "$ZONE_CACHE"
+    fi
+  done
+}
+
+resolve_zone() {
+  local zone="$1"
+
+  # Build cache if missing
+  if [[ ! -f "$ZONE_CACHE" ]]; then
+    discover_zones >&2
+  fi
+
+  # Exact match
+  local zid
+  zid=$(grep -P "^${zone}=" "$ZONE_CACHE" 2>/dev/null | cut -d= -f2 | head -1)
+  if [[ -n "$zid" ]]; then echo "$zid"; return; fi
+
+  # Partial match
+  zid=$(grep -iP "${zone}" "$ZONE_CACHE" 2>/dev/null | head -1 | cut -d= -f2)
+  if [[ -n "$zid" ]]; then echo "$zid"; return; fi
+
+  die "Unknown zone: ${zone}. Run '1984dns zones --refresh' to refresh."
+}
+
+# ---------------------------------------------------------------------------
+# Parse zone page → structured records
+# ---------------------------------------------------------------------------
+parse_zone() {
+  local html="$1"
+  local entries
+  entries=$(grep -oP 'entry_(\d+)' <<< "$html" | sed 's/entry_//' | sort -un)
+
+  printf "%-10s %-6s %-35s %-6s %-5s %s\n" "ENTRY_ID" "TYPE" "HOST" "TTL" "PRI" "VALUE"
+  printf "%-10s %-6s %-35s %-6s %-5s %s\n" "--------" "----" "----" "---" "---" "-----"
+
+  for eid in $entries; do
+    local type host rdata ttl pri
+    type=$(grep -oP "type_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    [[ -z "$type" ]] && continue
+    host=$(grep -oP "host_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    rdata=$(grep -oP "rdata_${eid}\"[^>]*value='\K[^']*" <<< "$html" 2>/dev/null || true)
+    ttl=$(grep -oP "ttl_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    pri=$(grep -oP "priority_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    rdata=$(echo "$rdata" | sed 's/&quot;/"/g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g')
+    printf "%-10s %-6s %-35s %-6s %-5s %s\n" "$eid" "$type" "$host" "${ttl:-3600}" "${pri:--}" "$rdata"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_zones() {
+  if [[ ! -f "$ZONE_CACHE" ]] || [[ "${1:-}" == "--refresh" ]]; then
+    discover_zones
+  fi
+  echo "Zones on account:"
+  while IFS='=' read -r name zid; do
+    printf "  %-25s zone_id=%s\n" "$name" "$zid"
+  done < "$ZONE_CACHE"
+}
+
+cmd_list() {
+  local zone="${1:-}"
+  [[ -z "$zone" ]] && die "Usage: 1984dns list <zone>"
+  local zid
+  zid=$(resolve_zone "$zone")
+  ensure_login
+
+  local html
+  html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/zone/${zid}/")
+  local zone_name
+  zone_name=$(grep -oP 'id="zone" value="\K[^"]*' <<< "$html")
+  echo "=== ${zone_name} (zone ${zid}) ==="
+  echo
+  parse_zone "$html"
+}
+
+cmd_get() {
+  local zone="$1" host="$2" type="${3:-}"
+  local zid
+  zid=$(resolve_zone "$zone")
+  ensure_login
+
+  local html
+  html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/zone/${zid}/")
+  local entries
+  entries=$(grep -oP 'entry_(\d+)' <<< "$html" | sed 's/entry_//' | sort -un)
+
+  for eid in $entries; do
+    local etype ehost erdata ettl epri
+    etype=$(grep -oP "type_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    ehost=$(grep -oP "host_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    [[ -z "$etype" ]] && continue
+    if [[ "$ehost" == "$host" ]]; then
+      if [[ -z "$type" || "$etype" == "$type" ]]; then
+        erdata=$(grep -oP "rdata_${eid}\"[^>]*value='\K[^']*" <<< "$html" 2>/dev/null || true)
+        erdata=$(echo "$erdata" | sed 's/&quot;/"/g; s/&amp;/\&/g')
+        ettl=$(grep -oP "ttl_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+        epri=$(grep -oP "priority_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$eid" "$etype" "$ehost" "${ettl:-3600}" "${epri:--}" "$erdata"
+      fi
+    fi
+  done
+}
+
+cmd_set() {
+  local zone="$1" type="$2" host="$3" rdata="$4" ttl="${5:-3600}" pri="${6:-0}"
+  local zid
+  zid=$(resolve_zone "$zone")
+  ensure_login
+
+  # Check if entry already exists (same type + host → update)
+  local html
+  html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/zone/${zid}/")
+  local entries existing_id=""
+  entries=$(grep -oP 'entry_(\d+)' <<< "$html" | sed 's/entry_//' | sort -un)
+
+  for eid in $entries; do
+    local etype ehost
+    etype=$(grep -oP "type_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    ehost=$(grep -oP "host_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    if [[ "$etype" == "$type" && "$ehost" == "$host" ]]; then
+      existing_id="$eid"
+      break
+    fi
+  done
+
+  local entry_id="${existing_id:-new}"
+  local csrf
+  csrf=$(get_csrf)
+  local zone_name
+  zone_name=$(grep -oP 'id="zone" value="\K[^"]*' <<< "$html")
+
+  local result
+  result=$(curl -s \
+    -b "$COOKIE_FILE" \
+    -c "$COOKIE_FILE" \
+    -X POST "${BASE_URL}/domains/entry/" \
+    -H "Referer: ${BASE_URL}/domains/zone/${zid}/" \
+    -H "X-CSRFToken: ${csrf}" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    -d "entry=${entry_id}&zone=${zone_name}&type=${type}&host=${host}&ttl=${ttl}&priority=${pri}&rdata=${rdata}")
+
+  if grep -q '"ok"' <<< "$result"; then
+    if [[ -n "$existing_id" ]]; then
+      echo "updated ${host}.${zone_name} ${type} → ${rdata} (entry ${existing_id})"
+    else
+      local new_id
+      new_id=$(echo "$result" | grep -oP '"entry":\s*\K\d+' || echo "?")
+      echo "created ${host}.${zone_name} ${type} → ${rdata} (entry ${new_id})"
+    fi
+  else
+    local errtxt
+    errtxt=$(echo "$result" | grep -oP '"errortxt":\s*"\K[^"]*' || echo "$result")
+    die "failed: ${errtxt}"
+  fi
+}
+
+cmd_del() {
+  local zone="$1" entry_id="$2"
+  local zid
+  zid=$(resolve_zone "$zone")
+  ensure_login
+
+  local csrf
+  csrf=$(get_csrf)
+
+  local result
+  result=$(curl -s \
+    -b "$COOKIE_FILE" \
+    -c "$COOKIE_FILE" \
+    -X POST "${BASE_URL}/domains/delentry/" \
+    -H "Referer: ${BASE_URL}/domains/zone/${zid}/" \
+    -H "X-CSRFToken: ${csrf}" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    -d "entry=${entry_id}")
+
+  if grep -q '"ok"' <<< "$result"; then
+    echo "deleted entry ${entry_id}"
+  else
+    die "delete failed: $result"
+  fi
+}
+
+cmd_point() {
+  local zone="$1" host="$2" ip="$3"
+  cmd_set "$zone" "A" "$host" "$ip" 3600
+}
+
+cmd_mx() {
+  local zone="$1" host="$2" value="$3" pri="${4:-10}"
+  cmd_set "$zone" "MX" "$host" "$value" 3600 "$pri"
+}
+
+cmd_txt() {
+  local zone="$1" host="$2" value="$3"
+  cmd_set "$zone" "TXT" "$host" "$value" 3600
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  zones)         cmd_zones "$@" ;;
+  list|ls)       cmd_list "$@" ;;
+  get)           [[ $# -lt 2 ]] && die "Usage: 1984dns get <zone> <host> [type]"; cmd_get "$@" ;;
+  set|add|update) [[ $# -lt 4 ]] && die "Usage: 1984dns set <zone> <type> <host> <value> [ttl] [pri]"; cmd_set "$@" ;;
+  del|delete|rm) [[ $# -lt 2 ]] && die "Usage: 1984dns del <zone> <entry_id>"; cmd_del "$@" ;;
+  point)         [[ $# -lt 3 ]] && die "Usage: 1984dns point <zone> <host> <ip>"; cmd_point "$@" ;;
+  mx)            [[ $# -lt 3 ]] && die "Usage: 1984dns mx <zone> <host> <value> [pri]"; cmd_mx "$@" ;;
+  txt)           [[ $# -lt 3 ]] && die "Usage: 1984dns txt <zone> <host> <value>"; cmd_txt "$@" ;;
+  version|--version|-v) echo "1984dns ${VERSION}" ;;
+  help|--help|-h)
+    cat <<'HELP'
+1984dns — CLI for 1984.is FreeDNS zone management
+
+Usage:
+  1984dns zones [--refresh]                                List all zones
+  1984dns list <zone>                                      List all records
+  1984dns get <zone> <host> [type]                         Get specific record(s)
+  1984dns set <zone> <type> <host> <value> [ttl] [pri]     Create or update
+  1984dns del <zone> <entry_id>                            Delete by entry ID
+  1984dns point <zone> <host> <ip>                         Quick A record
+  1984dns mx <zone> <host> <value> [pri]                   Set MX record
+  1984dns txt <zone> <host> <value>                        Set TXT record
+
+Config: DNS1984_USER and DNS1984_PASS via environment or ~/.config/1984dns/config
+
+Examples:
+  1984dns point example.is www 1.2.3.4
+  1984dns set example.is A @ 1.2.3.4
+  1984dns set example.is MX @ mail.example.is. 3600 10
+  1984dns txt example.is _dmarc '"v=DMARC1; p=reject"'
+  1984dns list example.is
+  1984dns del example.is 12345
+HELP
+    ;;
+  *) die "Unknown command: $CMD (try: 1984dns help)" ;;
+esac
