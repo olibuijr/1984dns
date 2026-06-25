@@ -201,6 +201,22 @@ cmd_get() {
   done
 }
 
+# Find an entry's ID in a zone page by matching type + host. Echoes id or "".
+find_entry_id() {
+  local html="$1" type="$2" host="$3"
+  local entries
+  entries=$(grep -oP 'entry_(\d+)' <<< "$html" | sed 's/entry_//' | sort -un)
+  for eid in $entries; do
+    local etype ehost
+    etype=$(grep -oP "type_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    ehost=$(grep -oP "host_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    if [[ "$etype" == "$type" && "$ehost" == "$host" ]]; then
+      echo "$eid"; return 0
+    fi
+  done
+  return 0
+}
+
 cmd_set() {
   local zone="$1" type="$2" host="$3" rdata="$4" ttl="${5:-3600}" pri="${6:-0}"
   local zid
@@ -210,18 +226,8 @@ cmd_set() {
   # Check if entry already exists (same type + host → update)
   local html
   html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/zone/${zid}/")
-  local entries existing_id=""
-  entries=$(grep -oP 'entry_(\d+)' <<< "$html" | sed 's/entry_//' | sort -un)
-
-  for eid in $entries; do
-    local etype ehost
-    etype=$(grep -oP "type_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
-    ehost=$(grep -oP "host_${eid}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
-    if [[ "$etype" == "$type" && "$ehost" == "$host" ]]; then
-      existing_id="$eid"
-      break
-    fi
-  done
+  local existing_id
+  existing_id=$(find_entry_id "$html" "$type" "$host")
 
   local entry_id="${existing_id:-new}"
   local csrf
@@ -243,9 +249,11 @@ cmd_set() {
     if [[ -n "$existing_id" ]]; then
       echo "updated ${host}.${zone_name} ${type} → ${rdata} (entry ${existing_id})"
     else
+      # Create response omits the new ID — re-read the zone and match type+host.
       local new_id
-      new_id=$(echo "$result" | grep -oP '"entry":\s*\K\d+' || echo "?")
-      echo "created ${host}.${zone_name} ${type} → ${rdata} (entry ${new_id})"
+      new_id=$(echo "$result" | grep -oP '"entry":\s*\K\d+' || true)
+      [[ -z "$new_id" ]] && new_id=$(find_entry_id "$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/zone/${zid}/")" "$type" "$host")
+      echo "created ${host}.${zone_name} ${type} → ${rdata} (entry ${new_id:-?})"
     fi
   else
     local errtxt
@@ -295,6 +303,129 @@ cmd_txt() {
   cmd_set "$zone" "TXT" "$host" "$value" 3600
 }
 
+# Verify a record is live on the zone's authoritative nameservers (post-write
+# propagation check — 1984.is rebuilds zones on a delay after web/API edits).
+cmd_verify() {
+  local zone="$1" host="$2" type="${3:-A}"
+  [[ -z "$zone" || -z "$host" ]] && die "Usage: 1984dns verify <zone> <host> [type]"
+  command -v dig >/dev/null || die "dig not found (install dnsutils/bind-tools)"
+
+  local fqdn
+  if [[ "$host" == "@" ]]; then fqdn="$zone"; else fqdn="${host}.${zone}"; fi
+
+  # Authoritative nameservers for the zone (public delegation).
+  local nslist
+  nslist=$(dig +short NS "$zone" 2>/dev/null | sed 's/\.$//' | sort)
+  [[ -z "$nslist" ]] && die "no NS records found for ${zone} (is it delegated?)"
+
+  echo "=== verify ${type} ${fqdn} across authoritative NS ==="
+  local seen_any=0
+  for ns in $nslist; do
+    local answer
+    answer=$(dig +short "@${ns}" "$fqdn" "$type" 2>/dev/null | paste -sd' ' -)
+    if [[ -n "$answer" ]]; then
+      printf "  ✓ %-28s %s\n" "$ns" "$answer"; seen_any=1
+    else
+      printf "  ✗ %-28s (no answer)\n" "$ns"
+    fi
+  done
+  [[ "$seen_any" == 0 ]] && echo "  → not yet propagated to any authoritative server"
+}
+
+# ---------------------------------------------------------------------------
+# Nameserver management (registrar-level NS delegation)
+# ---------------------------------------------------------------------------
+resolve_configure_id() {
+  local domain="$1"
+  ensure_login
+  local html
+  html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/")
+  # Find configure link — there may be one shared page or per-domain
+  local cfg_id
+  cfg_id=$(grep -oP '/configure/(\d+)/' <<< "$html" | grep -oP '\d+' | head -1)
+  [[ -z "$cfg_id" ]] && die "Could not find configure page"
+  echo "$cfg_id"
+}
+
+cmd_ns() {
+  local domain="${1:-}"
+  [[ -z "$domain" ]] && die "Usage: 1984dns ns <domain>"
+  ensure_login
+
+  local cfg_id
+  cfg_id=$(resolve_configure_id "$domain")
+
+  local html
+  html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/configure/${cfg_id}/")
+
+  # Check if this domain is on this configure page
+  local page_domain
+  page_domain=$(grep -oP 'name="domain" value="\K[^"]*' <<< "$html" | head -1)
+
+  echo "=== Nameservers for ${page_domain:-$domain} ==="
+  for i in 1 2 3 4 5; do
+    local ns
+    ns=$(grep -oP "nameserver${i}\"[^>]*value=\"\K[^\"]*" <<< "$html" 2>/dev/null || true)
+    [[ -n "$ns" ]] && printf "  NS%d: %s\n" "$i" "$ns"
+  done
+}
+
+cmd_ns_set() {
+  local domain="$1"
+  shift
+  local ns1="${1:-}" ns2="${2:-}" ns3="${3:-}" ns4="${4:-}" ns5="${5:-}"
+
+  [[ -z "$domain" ]] && die "Usage: 1984dns ns-set <domain> <ns1> [ns2] [ns3] [ns4] [ns5]"
+  [[ -z "$ns1" ]] && die "At least one nameserver required"
+
+  ensure_login
+
+  local cfg_id
+  cfg_id=$(resolve_configure_id "$domain")
+
+  local html csrf
+  html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/configure/${cfg_id}/")
+  csrf=$(grep -oP 'csrfmiddlewaretoken" value="\K[^"]+' <<< "$html" | head -1)
+  [[ -z "$csrf" ]] && csrf=$(get_csrf)
+
+  echo "Changing nameservers for ${domain}:"
+  [[ -n "$ns1" ]] && echo "  NS1: $ns1"
+  [[ -n "$ns2" ]] && echo "  NS2: $ns2"
+  [[ -n "$ns3" ]] && echo "  NS3: $ns3"
+  [[ -n "$ns4" ]] && echo "  NS4: $ns4"
+  [[ -n "$ns5" ]] && echo "  NS5: $ns5"
+
+  local result
+  result=$(curl -s \
+    -b "$COOKIE_FILE" \
+    -c "$COOKIE_FILE" \
+    -X POST "${BASE_URL}/domains/changenameservers/" \
+    -H "Referer: ${BASE_URL}/configure/${cfg_id}/" \
+    -H "X-CSRFToken: ${csrf}" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    -d "csrfmiddlewaretoken=${csrf}&domain=${domain}&nameserver1=${ns1}&nameserver2=${ns2}&nameserver3=${ns3}&nameserver4=${ns4}&nameserver5=${ns5}")
+
+  if echo "$result" | grep -q '"mainerror"'; then
+    local err
+    err=$(echo "$result" | grep -oP '"mainerror":\s*"\K[^"]*' || echo "$result")
+    die "NS change failed: $err"
+  fi
+
+  # Parse per-nameserver results
+  echo ""
+  for i in 1 2 3 4 5; do
+    local check msg
+    check=$(echo "$result" | grep -oP "\"nameserver${i}\":\s*\{\"check\":\s*\K(true|false)" || true)
+    msg=$(echo "$result" | grep -oP "\"nameserver${i}\":\s*\{[^}]*\"msg\":\s*\"\K[^\"]*" || true)
+    [[ -z "$check" ]] && continue
+    if [[ "$check" == "true" ]]; then
+      printf "  NS%d: ✓ %s\n" "$i" "${msg:-ok}"
+    else
+      printf "  NS%d: ✗ %s\n" "$i" "${msg:-failed}"
+    fi
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -310,6 +441,9 @@ case "$CMD" in
   point)         [[ $# -lt 3 ]] && die "Usage: 1984dns point <zone> <host> <ip>"; cmd_point "$@" ;;
   mx)            [[ $# -lt 3 ]] && die "Usage: 1984dns mx <zone> <host> <value> [pri]"; cmd_mx "$@" ;;
   txt)           [[ $# -lt 3 ]] && die "Usage: 1984dns txt <zone> <host> <value>"; cmd_txt "$@" ;;
+  verify|check)  [[ $# -lt 2 ]] && die "Usage: 1984dns verify <zone> <host> [type]"; cmd_verify "$@" ;;
+  ns)            [[ $# -lt 1 ]] && die "Usage: 1984dns ns <domain>"; cmd_ns "$@" ;;
+  ns-set)        [[ $# -lt 2 ]] && die "Usage: 1984dns ns-set <domain> <ns1> [ns2] [ns3] [ns4] [ns5]"; cmd_ns_set "$@" ;;
   version|--version|-v) echo "1984dns ${VERSION}" ;;
   help|--help|-h)
     cat <<'HELP'
@@ -324,6 +458,9 @@ Usage:
   1984dns point <zone> <host> <ip>                         Quick A record
   1984dns mx <zone> <host> <value> [pri]                   Set MX record
   1984dns txt <zone> <host> <value>                        Set TXT record
+  1984dns verify <zone> <host> [type]                      Check record is live on authoritative NS
+  1984dns ns <domain>                                      Show current nameservers
+  1984dns ns-set <domain> <ns1> [ns2] [ns3] [ns4] [ns5]   Change nameserver delegation
 
 Config: DNS1984_USER and DNS1984_PASS via environment or ~/.config/1984dns/config
 
@@ -334,6 +471,8 @@ Examples:
   1984dns txt example.is _dmarc '"v=DMARC1; p=reject"'
   1984dns list example.is
   1984dns del example.is 12345
+  1984dns ns olibuijr.com
+  1984dns ns-set olibuijr.com ns1.olibuijr.com ns2.olibuijr.com
 HELP
     ;;
   *) die "Unknown command: $CMD (try: 1984dns help)" ;;
