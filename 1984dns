@@ -223,6 +223,18 @@ cmd_set() {
   zid=$(resolve_zone "$zone")
   ensure_login
 
+  # SRV records use separate weight/port/target fields (1984.is form contract:
+  # priority + weight + port + target). Pass value as "weight port target".
+  local srv_fields=""
+  if [[ "${type^^}" == "SRV" ]]; then
+    local s_weight s_port s_target
+    read -r s_weight s_port s_target <<< "$rdata"
+    [[ -z "$s_weight" || -z "$s_port" || -z "$s_target" ]] && \
+      die "SRV needs: 1984dns set <zone> SRV <_svc._proto> \"<weight> <port> <target.>\" [ttl] [priority]"
+    rdata="$s_target"
+    srv_fields="&weight=${s_weight}&port=${s_port}&target=${s_target}"
+  fi
+
   # Check if entry already exists (same type + host → update)
   local html
   html=$(curl -s -b "$COOKIE_FILE" "${BASE_URL}/domains/zone/${zid}/")
@@ -243,9 +255,9 @@ cmd_set() {
     -H "Referer: ${BASE_URL}/domains/zone/${zid}/" \
     -H "X-CSRFToken: ${csrf}" \
     -H "X-Requested-With: XMLHttpRequest" \
-    -d "entry=${entry_id}&zone=${zone_name}&type=${type}&host=${host}&ttl=${ttl}&priority=${pri}&rdata=${rdata}")
+    -d "entry=${entry_id}&zone=${zone_name}&type=${type}&host=${host}&ttl=${ttl}&priority=${pri}&rdata=${rdata}${srv_fields}")
 
-  if grep -q '"ok"' <<< "$result"; then
+  if grep -qP '"ok":\s*true' <<< "$result"; then
     if [[ -n "$existing_id" ]]; then
       echo "updated ${host}.${zone_name} ${type} → ${rdata} (entry ${existing_id})"
     else
@@ -468,6 +480,7 @@ Examples:
   1984dns point example.is www 1.2.3.4
   1984dns set example.is A @ 1.2.3.4
   1984dns set example.is MX @ mail.example.is. 3600 10
+  1984dns set example.is SRV _imaps._tcp "1 993 mail.example.is." 3600 0   # value = "weight port target"
   1984dns txt example.is _dmarc '"v=DMARC1; p=reject"'
   1984dns list example.is
   1984dns del example.is 12345
