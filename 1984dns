@@ -242,6 +242,9 @@ cmd_set() {
   local existing_id
   existing_id=$(find_entry_id "$html" "$type" "$host")
 
+  # DNS1984_NEW=1 adds another record beside an existing one of the same type and host
+  # (several TXT records at the apex, several MX hosts) instead of replacing it.
+  [[ "${DNS1984_NEW:-}" == 1 ]] && existing_id=""
   local entry_id="${existing_id:-new}"
   local csrf
   csrf=$(get_csrf)
