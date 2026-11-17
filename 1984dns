@@ -225,14 +225,15 @@ cmd_set() {
 
   # SRV records use separate weight/port/target fields (1984.is form contract:
   # priority + weight + port + target). Pass value as "weight port target".
-  local srv_fields=""
+  # Every field is URL-encoded: a bare "+" (base64 in DKIM keys) would otherwise arrive as a space.
+  local srv_fields=()
   if [[ "${type^^}" == "SRV" ]]; then
     local s_weight s_port s_target
     read -r s_weight s_port s_target <<< "$rdata"
     [[ -z "$s_weight" || -z "$s_port" || -z "$s_target" ]] && \
       die "SRV needs: 1984dns set <zone> SRV <_svc._proto> \"<weight> <port> <target.>\" [ttl] [priority]"
     rdata="$s_target"
-    srv_fields="&weight=${s_weight}&port=${s_port}&target=${s_target}"
+    srv_fields=(--data-urlencode "weight=${s_weight}" --data-urlencode "port=${s_port}" --data-urlencode "target=${s_target}")
   fi
 
   # Check if entry already exists (same type + host → update)
@@ -255,7 +256,9 @@ cmd_set() {
     -H "Referer: ${BASE_URL}/domains/zone/${zid}/" \
     -H "X-CSRFToken: ${csrf}" \
     -H "X-Requested-With: XMLHttpRequest" \
-    -d "entry=${entry_id}&zone=${zone_name}&type=${type}&host=${host}&ttl=${ttl}&priority=${pri}&rdata=${rdata}${srv_fields}")
+    --data-urlencode "entry=${entry_id}" --data-urlencode "zone=${zone_name}" --data-urlencode "type=${type}" \
+    --data-urlencode "host=${host}" --data-urlencode "ttl=${ttl}" --data-urlencode "priority=${pri}" \
+    --data-urlencode "rdata=${rdata}" "${srv_fields[@]}")
 
   if grep -qP '"ok":\s*true' <<< "$result"; then
     if [[ -n "$existing_id" ]]; then
